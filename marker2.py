@@ -2,361 +2,280 @@ import fitz  # PyMuPDF
 import os
 import re
 import hashlib
-import logging
-import queue
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 from PIL import Image
+import concurrent.futures
 import io
+from typing import List, Dict, Tuple, Optional, Any
+import logging
+from urllib.parse import urlparse
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('pdf_processor.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-@dataclass
-class ProcessingJob:
-    job_id: str
-    pdf_paths: List[Path]
-    user_id: str
-    output_base_dir: Path
-    status: str = "pending"
+# --- Configuration ---
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+IMAGE_SAVE_DIR = os.path.join(BASE_DIR, "output_hybrid_images")
+TXT_OUTPUT_DIR = os.path.join(BASE_DIR, "output_hybrid_text_files")
+PIXMAP_DPI = 150
+
+# Keep the get_image_explanation placeholder as is
+def get_image_explanation(image_as_jpg: bytes, prompt_in_detail: str) -> Optional[str]:
+    """Your existing image explanation function"""
+    # ... (keep your existing implementation)
+    pass
+
+def extract_urls_from_text(text: str) -> List[Tuple[str, str]]:
+    """
+    Extract URLs from text using regex patterns.
+    Returns list of tuples (link_text, url)
+    """
+    # Match both explicit URLs and text with hyperlinks
+    url_patterns = [
+        r'(?P<text>[^\s]+)\s*\((?P<url>https?://[^\s\)]+)\)',  # Format: text(http://...)
+        r'(?P<url>https?://[^\s]+)',  # Plain URLs
+    ]
     
-class PDFProcessor:
-    def __init__(self, base_output_dir: Path):
-        self.base_output_dir = base_output_dir
-        self.active_jobs: Dict[str, ProcessingJob] = {}
-        self.job_queue = queue.Queue()
-        self.job_lock = threading.Lock()
-        self.processed_files: Set[Path] = set()
-        self.file_lock = threading.Lock()
-        
-        # Create worker thread
-        self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
-        self.worker_thread.start()
-        
-        # Ensure base directories exist
-        self.base_output_dir.mkdir(parents=True, exist_ok=True)
-        
-    def _get_user_dirs(self, user_id: str) -> Tuple[Path, Path]:
-        """Create and return user-specific output directories."""
-        user_base = self.base_output_dir / user_id
-        image_dir = user_base / "images"
-        text_dir = user_base / "text"
-        
-        image_dir.mkdir(parents=True, exist_ok=True)
-        text_dir.mkdir(parents=True, exist_ok=True)
-        
-        return image_dir, text_dir
+    urls = []
+    for pattern in url_patterns:
+        matches = re.finditer(pattern, text)
+        for match in matches:
+            match_dict = match.groupdict()
+            if 'text' in match_dict and match_dict['text']:
+                urls.append((match_dict['text'], match_dict['url']))
+            else:
+                # If no explicit text, use the URL itself as text
+                urls.append((match_dict['url'], match_dict['url']))
+    
+    return urls
 
-    def submit_job(self, pdf_paths: List[Path], user_id: str) -> str:
-        """Submit a new processing job."""
-        # Generate unique job ID
-        job_id = hashlib.sha256(f"{user_id}_{time.time()}".encode()).hexdigest()[:12]
-        
-        # Create user directories
-        image_dir, text_dir = self._get_user_dirs(user_id)
-        
-        # Create job
-        job = ProcessingJob(
-            job_id=job_id,
-            pdf_paths=pdf_paths,
-            user_id=user_id,
-            output_base_dir=self.base_output_dir
-        )
-        
-        with self.job_lock:
-            self.active_jobs[job_id] = job
-            self.job_queue.put(job)
-            
-        logger.info(f"Submitted job {job_id} for user {user_id} with {len(pdf_paths)} PDFs")
-        return job_id
+def sanitize_filename_for_paths(filename: str) -> str:
+    """Creates a safe string usable for directory and file names."""
+    name_part = Path(filename).stem
+    sanitized = re.sub(r'\W+', '_', name_part)
+    hasher = hashlib.sha1(filename.encode())
+    short_hash = hasher.hexdigest()[:8]
+    final_name = f"{sanitized[:60]}_{short_hash}".strip('_')
+    if not final_name:
+        final_name = f"pdf_{short_hash}"
+    return final_name
 
-    def get_job_status(self, job_id: str) -> Optional[str]:
-        """Get the status of a specific job."""
-        with self.job_lock:
-            job = self.active_jobs.get(job_id)
-            return job.status if job else None
-
-    def _process_queue(self):
-        """Main worker thread processing loop."""
-        while True:
-            try:
-                job = self.job_queue.get()
-                logger.info(f"Processing job {job.job_id}")
-                
-                try:
-                    self._process_job(job)
-                except Exception as e:
-                    logger.error(f"Error processing job {job.job_id}: {e}")
-                    with self.job_lock:
-                        job.status = "failed"
-                
-                self.job_queue.task_done()
-                
-            except Exception as e:
-                logger.error(f"Error in queue processing: {e}")
-                time.sleep(1)  # Prevent tight loop on error
-
-    def _process_job(self, job: ProcessingJob):
-        """Process a single job with multiple PDFs."""
-        image_dir, text_dir = self._get_user_dirs(job.user_id)
-        
-        with self.job_lock:
-            job.status = "processing"
-        
-        # Process PDFs in parallel
-        with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as executor:
-            future_to_pdf = {
-                executor.submit(
-                    self._process_single_pdf,
-                    pdf_path,
-                    image_dir,
-                    text_dir
-                ): pdf_path for pdf_path in job.pdf_paths
-            }
-            
-            for future in as_completed(future_to_pdf):
-                pdf_path = future_to_pdf[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Error processing {pdf_path}: {e}")
-        
-        with self.job_lock:
-            job.status = "completed"
-
-    def _process_single_pdf(self, pdf_path: Path, image_dir: Path, text_dir: Path):
-        """Process a single PDF file."""
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-            
-        # Check if already processed
-        with self.file_lock:
-            if pdf_path in self.processed_files:
-                logger.info(f"Skipping already processed file: {pdf_path}")
-                return
-            self.processed_files.add(pdf_path)
-        
-        logger.info(f"Processing PDF: {pdf_path}")
-        
-        # Create PDF-specific directories
-        pdf_name = self._sanitize_filename(pdf_path.name)
-        pdf_image_dir = image_dir / pdf_name
-        pdf_image_dir.mkdir(exist_ok=True)
-        
-        doc = fitz.open(str(pdf_path))
-        text_parts = []
-        total_pages = len(doc)
-        
-        try:
-            # Process all pages
-            for page_num in range(total_pages):
-                actual_page_num = page_num + 1  # Convert to 1-based page numbers
-                logger.info(f"Processing page {actual_page_num}/{total_pages} of {pdf_path.name}")
-                
-                try:
-                    page = doc[page_num]
-                    page_text = self._process_page(
-                        page=page,
-                        page_num=actual_page_num,
-                        pdf_path=pdf_path,
-                        image_dir=pdf_image_dir
-                    )
-                    
-                    text_parts.append(f"\n\n--- Page {actual_page_num} ---\n\n")
-                    text_parts.append(page_text)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing page {actual_page_num}: {e}")
-                    text_parts.append(f"\n\n--- Page {actual_page_num} ---\n\n")
-                    text_parts.append(f"[Error processing page: {str(e)}]\n")
-                
-        finally:
-            doc.close()
-            
-        # Save complete text output
-        output_text = "".join(text_parts)
-        output_path = text_dir / f"{pdf_name}_processed.txt"
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(output_text)
-            
-        logger.info(f"Completed processing {pdf_path}")
-
-    def _process_page(self, page: fitz.Page, page_num: int, pdf_path: Path, image_dir: Path) -> str:
-        """Process a single page, handling both simple and complex cases."""
-        # Check page complexity
-        images = page.get_images(full=True)
-        tables = page.find_tables()
-        has_complex_content = bool(images) or bool(tables)
-        
-        if not has_complex_content:
-            # Simple text extraction
-            return self._extract_simple_page(page)
-        
-        # Complex page processing
-        return self._process_complex_page(
-            page=page,
-            page_num=page_num,
-            pdf_path=pdf_path,
-            image_dir=image_dir,
-            images=images,
-            tables=tables
-        )
-
-    def _extract_simple_page(self, page: fitz.Page) -> str:
-        """Extract text from a simple page."""
-        text = page.get_text(sort=True)
-        if not text.strip():
-            return "[EMPTY PAGE]\n"
-        return text
-
-    def _process_complex_page(
-        self,
-        page: fitz.Page,
-        page_num: int,
-        pdf_path: Path,
-        image_dir: Path,
-        images: List,
-        tables: List
-    ) -> str:
-        """Process a complex page with images and/or tables."""
-        try:
-            # Extract and save images
-            image_paths = []
-            for img_idx, img in enumerate(images):
-                try:
-                    xref = img[0]
-                    image_path = self._extract_and_save_image(
-                        page.parent,  # doc
-                        xref,
-                        image_dir,
-                        page_num,
-                        img_idx
-                    )
-                    if image_path:
-                        image_paths.append(str(image_path.absolute()))
-                except Exception as e:
-                    logger.error(f"Error extracting image {img_idx} from page {page_num}: {e}")
-
-            # Try complex extraction first
-            try:
-                text = page.get_text(sort=True)
-                
-                # Process tables
-                for table in tables:
-                    table_text = self._extract_table_content(table)
-                    if table_text:
-                        text = self._insert_table_marker(text, table_text)
-
-                # Add image markers
-                for idx, image_path in enumerate(image_paths):
-                    marker = f"[IMAGE_MARKER|path={image_path}|explanation=Image {idx + 1} on page {page_num}|END_IMAGE_MARKER]\n"
-                    text = self._insert_image_marker(text, marker)
-
-            except Exception as e:
-                logger.warning(f"Complex extraction failed for page {page_num}, using simple fallback: {e}")
-                # Simple fallback: just get basic text
-                text = page.get_text() or "[Failed to extract text]\n"
-                
-            return text
-
-        except Exception as e:
-            logger.error(f"Page processing failed completely for page {page_num}: {e}")
-            return "[Page processing failed]\n"
-
-    def _extract_and_save_image(
-        self,
-        doc: fitz.Document,
-        xref: int,
-        image_dir: Path,
-        page_num: int,
-        img_idx: int
-    ) -> Optional[Path]:
-        """Extract and save a single image."""
-        try:
-            img_data = doc.extract_image(xref)
-            if not img_data:
-                return None
-
-            image_bytes = img_data["image"]
-            ext = img_data["ext"]
-            
-            image_path = image_dir / f"page_{page_num}_img_{img_idx}.{ext}"
-            
-            img = Image.open(io.BytesIO(image_bytes))
-            if img.mode in ['RGBA', 'P', 'LA']:
-                img = img.convert('RGB')
-            
-            img.save(image_path)
-            return image_path
-
-        except Exception as e:
-            logger.error(f"Error saving image {xref} from page {page_num}: {e}")
+def extract_and_save_image_simple(
+    doc: fitz.Document,
+    xref: int,
+    save_dir: Path,
+    page_num: int,
+    img_idx_on_page: int
+) -> Optional[str]:
+    """Extracts a single image by xref, saves it, returns absolute path."""
+    try:
+        img_data = doc.extract_image(xref)
+        if not img_data:
             return None
 
-    def _extract_table_content(self, table) -> str:
-        """Extract content from a table."""
-        try:
-            cells = table.cells
-            if not cells:
-                return ""
+        image_bytes = img_data["image"]
+        ext = img_data["ext"]
+
+        # Ensure save_dir exists
+        os.makedirs(save_dir, exist_ok=True)
+
+        image_filename = f"page_{page_num}_img_{img_idx_on_page}.{ext}"
+        save_path = save_dir / image_filename
+
+        img_pil = Image.open(io.BytesIO(image_bytes))
+        if img_pil.mode in ['RGBA', 'P', 'LA']:
+            img_pil = img_pil.convert('RGB')
+        img_pil.save(save_path)
+
+        # Always return absolute path
+        return os.path.abspath(save_path)
+
+    except Exception as e:
+        logger.error(f"Error saving image xref {xref} on page {page_num}: {e}")
+        return None
+
+def process_single_pdf_hybrid(pdf_path: str) -> Optional[str]:
+    """
+    Processes a single PDF using the hybrid approach.
+    Uses Fitz text for simple pages, multimodal func for complex pages.
+    """
+    pdf_path = os.path.abspath(pdf_path)
+    filename = Path(pdf_path).name
+    sanitized_name = sanitize_filename_for_paths(filename)
+    logger.info(f"Processing '{filename}' (Sanitized: {sanitized_name})...")
+    
+    pdf_image_dir = Path(IMAGE_SAVE_DIR) / sanitized_name
+
+    try:
+        os.makedirs(pdf_image_dir, exist_ok=True)
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)  # Get actual page count
+        final_text_parts: List[str] = []
+        page_separator = f"\n\n---\n\n## Page {{page_num}} of {total_pages}\n\n"
+
+        for page_num in range(total_pages):  # Use 0-based indexing internally
+            actual_page_num = page_num + 1  # Convert to 1-based for display
+            logger.info(f"Processing Page {actual_page_num}/{total_pages} for '{filename}'...")
+            page_processed_text: Optional[str] = None
+
+            try:
+                page = doc[page_num]  # Get page using 0-based index
+                # Check complexity
+                image_list = page.get_images(full=False)
+                is_complex = bool(image_list) or bool(page.find_tables())
+
+                if not is_complex:
+                    # Process Simple Page
+                    logger.info(f"Page {actual_page_num}: Simple text extraction.")
+                    # Fixed: Use correct fitz flags
+                    page_processed_text = page.get_text(
+                        "text",
+                        sort=True,
+                        flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_IMAGES
+                    )
+                    
+                    # Extract and mark URLs in the text
+                    urls = extract_urls_from_text(page_processed_text)
+                    for link_text, url in urls:
+                        marker = f"[URL_MARKER|href={url}|END_URL_MARKER]"
+                        page_processed_text = page_processed_text.replace(
+                            link_text,
+                            f"{link_text} {marker}"
+                        )
+
+                    if not page_processed_text:
+                        page_processed_text = "[EMPTY PAGE]\n"
+
+                else:
+                    # Process Complex Page
+                    logger.info(f"Page {actual_page_num}: Complex page detected (Images/Tables).")
+                    image_paths_on_page: List[str] = []
+                    
+                    # Extract & Save Images
+                    for img_idx, img_info in enumerate(image_list):
+                        xref = img_info[0]
+                        absolute_image_path = extract_and_save_image_simple(
+                            doc, xref, pdf_image_dir, actual_page_num, img_idx
+                        )
+                        if absolute_image_path:
+                            image_paths_on_page.append(absolute_image_path)
+                            logger.info(f"Extracted image: {absolute_image_path}")
+
+                    # Render Page
+                    pix = page.get_pixmap(dpi=PIXMAP_DPI)
+                    page_image_bytes = pix.tobytes("png")
+
+                    # Construct Detailed Prompt (using absolute paths)
+                    detailed_prompt = f"""Analyze the provided image of page {actual_page_num} from document '{filename}'.
+Instructions:
+1. Perform OCR to extract all text in the correct reading order.
+2. Identify any distinct images visible within the page image.
+3. Identify any tables visible within the page image.
+4. Generate a concise textual explanation for each identified image.
+5. The following image file paths correspond to the images on this page: {image_paths_on_page}
+6. Reconstruct the full text content of the page, maintaining the reading order.
+7. Use absolute paths in image markers: [IMAGE_MARKER|path=<ABSOLUTE_PATH>|explanation=<EXPLANATION>|END_IMAGE_MARKER]
+8. For tables: [TABLE_MARKER]<extracted table content>[END_TABLE_MARKER]
+9. For URLs: [URL_MARKER|href=<url>|END_URL_MARKER]
+10. Return ONLY the reconstructed text with markers embedded.
+"""
+
+                    # Call Multimodal Function
+                    page_processed_text = get_image_explanation(
+                        image_as_jpg=page_image_bytes,
+                        prompt_in_detail=detailed_prompt
+                    )
+
+                    if page_processed_text is None:
+                        logger.warning(f"Multimodal function failed for page {actual_page_num}. Using fallback.")
+                        page_processed_text = page.get_text(
+                            "text",
+                            sort=True,
+                            flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES
+                        )
+                        if not page_processed_text:
+                            page_processed_text = "[COMPLEX PAGE PROCESSING FAILED]\n"
+
+            except Exception as page_proc_err:
+                logger.error(f"Error processing page {actual_page_num}: {page_proc_err}")
+                page_processed_text = f"[ERROR PROCESSING PAGE {actual_page_num}: {str(page_proc_err)}]\n"
+
+            # Append processed text with correct page numbering
+            final_text_parts.append(page_separator.format(page_num=actual_page_num))
+            final_text_parts.append(page_processed_text.strip() if page_processed_text else "")
+
+        doc.close()
+        full_modified_text = "".join(final_text_parts)
+        logger.info(f"Finished processing '{filename}'. Text length: {len(full_modified_text)}")
+        return full_modified_text
+
+    except Exception as e:
+        logger.error(f"Error processing PDF '{pdf_path}': {e}", exc_info=True)
+        return None
+
+def process_pdfs_concurrent(pdf_paths: List[str], max_workers: Optional[int] = None) -> Dict[str, Optional[str]]:
+    """
+    Process multiple PDFs concurrently with proper thread management.
+    """
+    if max_workers is None:
+        max_workers = min(4, os.cpu_count() or 1)
+    
+    results: Dict[str, Optional[str]] = {}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_pdf = {
+            executor.submit(process_single_pdf_hybrid, pdf_path): pdf_path 
+            for pdf_path in pdf_paths
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_pdf):
+            pdf_path = future_to_pdf[future]
+            try:
+                results[pdf_path] = future.result()
+            except Exception as exc:
+                logger.error(f"PDF processing failed for {pdf_path}: {exc}")
+                results[pdf_path] = None
                 
-            table_text = []
-            for row in cells:
-                row_text = " | ".join(cell.text.strip() for cell in row)
-                table_text.append(row_text)
-                
-            return "\n".join(table_text)
-        except Exception as e:
-            logger.error(f"Error extracting table content: {e}")
-            return ""
+    return results
 
-    def _insert_table_marker(self, text: str, table_content: str) -> str:
-        """Insert table marker at appropriate position."""
-        return f"{text}\n[TABLE_MARKER]\n{table_content}\n[END_TABLE_MARKER]\n"
-
-    def _insert_image_marker(self, text: str, marker: str) -> str:
-        """Insert image marker at appropriate position."""
-        return f"{text}\n{marker}"
-
-    @staticmethod
-    def _sanitize_filename(filename: str) -> str:
-        """Create a safe string for directory and file names."""
-        name = Path(filename).stem
-        sanitized = re.sub(r'\W+', '_', name)
-        hash_part = hashlib.sha1(filename.encode()).hexdigest()[:8]
-        final_name = f"{sanitized[:60]}_{hash_part}".strip('_')
-        return final_name if final_name else f"pdf_{hash_part}"
-
-# Usage Example
 if __name__ == "__main__":
-    base_dir = Path("/absolute/path/to/output")
-    processor = PDFProcessor(base_dir)
+    # Create output directories
+    os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+    os.makedirs(TXT_OUTPUT_DIR, exist_ok=True)
+
+    # Find PDF files
+    pdf_files = [str(p) for p in Path(".").glob("*.pdf") if p.is_file()]
     
-    # Example usage for multiple users/PDFs
-    pdf_paths = [Path("/path/to/pdf1.pdf"), Path("/path/to/pdf2.pdf")]
-    user_id = "user123"
+    if not pdf_files:
+        logger.error("No PDF files found in the current directory.")
+        exit()
+
+    logger.info(f"Found {len(pdf_files)} PDF files to process.")
     
-    # Submit job
-    job_id = processor.submit_job(pdf_paths, user_id)
+    # Process PDFs
+    results = process_pdfs_concurrent(pdf_files)
     
-    # Check status (in real usage, you'd probably want to poll this)
-    while True:
-        status = processor.get_job_status(job_id)
-        if status in ["completed", "failed"]:
-            break
-        time.sleep(1)
-    
-    print(f"Job {job_id} finished with status: {status}")
+    # Save results
+    success_count = 0
+    for pdf_path, text_content in results.items():
+        if text_content is not None:
+            sanitized_name = sanitize_filename_for_paths(Path(pdf_path).name)
+            output_path = os.path.join(TXT_OUTPUT_DIR, f"{sanitized_name}_hybrid_marked_up.txt")
+            
+            try:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(text_content)
+                success_count += 1
+            except Exception as write_err:
+                logger.error(f"Failed to save output for {pdf_path}: {write_err}")
+
+    logger.info(f"\nProcessing Summary:")
+    logger.info(f"Total PDFs: {len(pdf_files)}")
+    logger.info(f"Successfully processed: {success_count}")
+    logger.info(f"Failed: {len(pdf_files) - success_count}")
+    logger.info(f"Output directory: {os.path.abspath(TXT_OUTPUT_DIR)}")
+    logger.info(f"Images directory: {os.path.abspath(IMAGE_SAVE_DIR)}")
